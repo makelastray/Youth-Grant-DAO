@@ -8,12 +8,17 @@
 (define-constant ERR_PROPOSAL_NOT_PASSED (err u107))
 (define-constant ERR_INVALID_AGE (err u108))
 (define-constant ERR_INVALID_AMOUNT (err u109))
+(define-constant ERR_DELEGATE_NOT_FOUND (err u110))
+(define-constant ERR_SELF_DELEGATION (err u111))
+(define-constant ERR_DELEGATE_INACTIVE (err u112))
+(define-constant ERR_MAX_DELEGATION_REACHED (err u113))
 
 (define-constant VOTING_PERIOD u144)
 (define-constant MIN_AGE u13)
 (define-constant MAX_AGE u25)
 (define-constant MIN_PROPOSAL_AMOUNT u1000000)
 (define-constant MAX_PROPOSAL_AMOUNT u50000000)
+(define-constant MAX_DELEGATIONS_PER_DELEGATE u10)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var proposal-counter uint u0)
@@ -34,6 +39,10 @@
 (define-map votes {proposal-id: uint, voter: principal} bool)
 (define-map member-ages principal uint)
 (define-map member-reputation principal uint)
+(define-map delegations principal principal)
+(define-map delegation-counts principal uint)
+(define-map delegate-performance principal {total-votes: uint, successful-votes: uint})
+(define-map delegated-votes {proposal-id: uint, delegate: principal} {vote-for: bool, delegator-count: uint})
 
 (define-public (set-member-age (age uint))
     (begin
@@ -239,3 +248,167 @@
         )
     )
 )
+
+(define-public (delegate-vote (delegate principal))
+    (let (
+        (delegator tx-sender)
+        (delegate-age (default-to u0 (map-get? member-ages delegate)))
+        (delegator-age (default-to u0 (map-get? member-ages delegator)))
+        (current-delegate-count (default-to u0 (map-get? delegation-counts delegate)))
+    )
+        (asserts! (not (is-eq delegator delegate)) ERR_SELF_DELEGATION)
+        (asserts! (and (>= delegate-age MIN_AGE) (<= delegate-age MAX_AGE)) ERR_DELEGATE_INACTIVE)
+        (asserts! (and (>= delegator-age MIN_AGE) (<= delegator-age MAX_AGE)) ERR_INVALID_AGE)
+        (asserts! (< current-delegate-count MAX_DELEGATIONS_PER_DELEGATE) ERR_MAX_DELEGATION_REACHED)
+        
+        (match (map-get? delegations delegator)
+            current-delegate (begin
+                (map-set delegation-counts current-delegate 
+                    (- (default-to u0 (map-get? delegation-counts current-delegate)) u1))
+                (map-set delegation-counts delegate (+ current-delegate-count u1))
+                (map-set delegations delegator delegate)
+            )
+            (begin
+                (map-set delegation-counts delegate (+ current-delegate-count u1))
+                (map-set delegations delegator delegate)
+            )
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation)
+    (let (
+        (delegator tx-sender)
+        (current-delegate (unwrap! (map-get? delegations delegator) ERR_DELEGATE_NOT_FOUND))
+    )
+        (map-set delegation-counts current-delegate 
+            (- (default-to u0 (map-get? delegation-counts current-delegate)) u1))
+        (map-delete delegations delegator)
+        (ok true)
+    )
+)
+
+(define-public (vote-as-delegate (proposal-id uint) (vote-for bool))
+    (let (
+        (delegate tx-sender)
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (current-block stacks-block-height)
+        (voting-deadline (+ (get created-at proposal) VOTING_PERIOD))
+        (delegate-age (default-to u0 (map-get? member-ages delegate)))
+        (delegation-count (default-to u0 (map-get? delegation-counts delegate)))
+        (voting-power (+ u1 delegation-count))
+    )
+        (asserts! (and (>= delegate-age MIN_AGE) (<= delegate-age MAX_AGE)) ERR_INVALID_AGE)
+        (asserts! (<= current-block voting-deadline) ERR_VOTING_PERIOD_ENDED)
+        (asserts! (is-none (map-get? votes {proposal-id: proposal-id, voter: delegate})) ERR_ALREADY_VOTED)
+        (asserts! (is-none (map-get? delegated-votes {proposal-id: proposal-id, delegate: delegate})) ERR_ALREADY_VOTED)
+        
+        (map-set votes {proposal-id: proposal-id, voter: delegate} true)
+        (map-set delegated-votes {proposal-id: proposal-id, delegate: delegate} 
+            {vote-for: vote-for, delegator-count: delegation-count})
+        
+        (if vote-for
+            (map-set proposals proposal-id 
+                (merge proposal {votes-for: (+ (get votes-for proposal) voting-power)}))
+            (map-set proposals proposal-id 
+                (merge proposal {votes-against: (+ (get votes-against proposal) voting-power)}))
+        )
+        
+        (let ((current-rep (default-to u0 (map-get? member-reputation delegate))))
+            (map-set member-reputation delegate (+ current-rep voting-power))
+        )
+        
+        (let ((perf (default-to {total-votes: u0, successful-votes: u0} 
+                    (map-get? delegate-performance delegate))))
+            (map-set delegate-performance delegate 
+                {total-votes: (+ (get total-votes perf) u1), 
+                 successful-votes: (get successful-votes perf)})
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (update-delegate-performance (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (current-block stacks-block-height)
+        (voting-deadline (+ (get created-at proposal) VOTING_PERIOD))
+        (proposal-passed (> (get votes-for proposal) (get votes-against proposal)))
+    )
+        (asserts! (> current-block voting-deadline) ERR_VOTING_PERIOD_ACTIVE)
+        (asserts! (get executed proposal) ERR_PROPOSAL_NOT_PASSED)
+        
+        (match (map-get? delegated-votes {proposal-id: proposal-id, delegate: tx-sender})
+            delegated-vote (let (
+                (vote-aligned-with-outcome (is-eq (get vote-for delegated-vote) proposal-passed))
+                (perf (default-to {total-votes: u0, successful-votes: u0} 
+                        (map-get? delegate-performance tx-sender)))
+            )
+                (if vote-aligned-with-outcome
+                    (map-set delegate-performance tx-sender 
+                        {total-votes: (get total-votes perf), 
+                         successful-votes: (+ (get successful-votes perf) u1)})
+                    false
+                )
+                (ok true)
+            )
+            ERR_DELEGATE_NOT_FOUND
+        )
+    )
+)
+
+(define-read-only (get-delegation (member principal))
+    (map-get? delegations member)
+)
+
+(define-read-only (get-delegation-count (delegate principal))
+    (default-to u0 (map-get? delegation-counts delegate))
+)
+
+(define-read-only (get-delegate-performance (delegate principal))
+    (default-to {total-votes: u0, successful-votes: u0} (map-get? delegate-performance delegate))
+)
+
+(define-read-only (get-delegate-success-rate (delegate principal))
+    (let ((perf (get-delegate-performance delegate)))
+        (if (> (get total-votes perf) u0)
+            (/ (* (get successful-votes perf) u100) (get total-votes perf))
+            u0
+        )
+    )
+)
+
+(define-read-only (get-voting-power (member principal))
+    (let (
+        (delegation-count (get-delegation-count member))
+        (member-age (default-to u0 (map-get? member-ages member)))
+    )
+        (if (and (>= member-age MIN_AGE) (<= member-age MAX_AGE))
+            (+ u1 delegation-count)
+            u0
+        )
+    )
+)
+
+(define-read-only (get-delegated-vote (proposal-id uint) (delegate principal))
+    (map-get? delegated-votes {proposal-id: proposal-id, delegate: delegate})
+)
+
+(define-read-only (is-eligible-delegate (delegate principal))
+    (let (
+        (delegate-age (default-to u0 (map-get? member-ages delegate)))
+        (current-delegations (get-delegation-count delegate))
+    )
+        (and 
+            (>= delegate-age MIN_AGE) 
+            (<= delegate-age MAX_AGE)
+            (< current-delegations MAX_DELEGATIONS_PER_DELEGATE)
+        )
+    )
+)
+
+
+
