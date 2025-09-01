@@ -12,6 +12,11 @@
 (define-constant ERR_SELF_DELEGATION (err u111))
 (define-constant ERR_DELEGATE_INACTIVE (err u112))
 (define-constant ERR_MAX_DELEGATION_REACHED (err u113))
+(define-constant ERR_NOT_MENTOR (err u114))
+(define-constant ERR_MENTORSHIP_NOT_FOUND (err u115))
+(define-constant ERR_MENTORSHIP_ALREADY_EXISTS (err u116))
+(define-constant ERR_INVALID_EXPERTISE (err u117))
+(define-constant ERR_MENTORSHIP_COMPLETED (err u118))
 
 (define-constant VOTING_PERIOD u144)
 (define-constant MIN_AGE u13)
@@ -19,6 +24,8 @@
 (define-constant MIN_PROPOSAL_AMOUNT u1000000)
 (define-constant MAX_PROPOSAL_AMOUNT u50000000)
 (define-constant MAX_DELEGATIONS_PER_DELEGATE u10)
+(define-constant MAX_MENTORSHIPS_PER_MENTOR u5)
+(define-constant MENTORSHIP_DURATION u720)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var proposal-counter uint u0)
@@ -43,6 +50,9 @@
 (define-map delegation-counts principal uint)
 (define-map delegate-performance principal {total-votes: uint, successful-votes: uint})
 (define-map delegated-votes {proposal-id: uint, delegate: principal} {vote-for: bool, delegator-count: uint})
+(define-map mentors principal {expertise: (string-ascii 100), active-mentorships: uint, total-mentorships: uint, rating-sum: uint, rating-count: uint})
+(define-map mentorships {mentor: principal, mentee: principal} {start-block: uint, status: (string-ascii 20), milestones-completed: uint, total-milestones: uint})
+(define-map mentorship-applications {applicant: principal, mentor: principal} {expertise-needed: (string-ascii 100), application-block: uint})
 
 (define-public (set-member-age (age uint))
     (begin
@@ -407,6 +417,210 @@
             (<= delegate-age MAX_AGE)
             (< current-delegations MAX_DELEGATIONS_PER_DELEGATE)
         )
+    )
+)
+
+;; Youth Mentorship Program Functions
+
+(define-public (register-as-mentor (expertise (string-ascii 100)))
+    (let (
+        (mentor-age (default-to u0 (map-get? member-ages tx-sender)))
+    )
+        ;; Verify member is eligible (18+ years old for mentors)
+        (asserts! (>= mentor-age u18) ERR_INVALID_AGE)
+        (asserts! (<= mentor-age MAX_AGE) ERR_INVALID_AGE)
+        (asserts! (> (len expertise) u0) ERR_INVALID_EXPERTISE)
+        
+        ;; Register or update mentor profile
+        (map-set mentors tx-sender {
+            expertise: expertise,
+            active-mentorships: u0,
+            total-mentorships: u0,
+            rating-sum: u0,
+            rating-count: u0
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (apply-for-mentorship (mentor principal) (expertise-needed (string-ascii 100)))
+    (let (
+        (applicant-age (default-to u0 (map-get? member-ages tx-sender)))
+        (mentor-info (unwrap! (map-get? mentors mentor) ERR_NOT_MENTOR))
+    )
+        ;; Verify applicant eligibility
+        (asserts! (>= applicant-age MIN_AGE) ERR_INVALID_AGE)
+        (asserts! (<= applicant-age MAX_AGE) ERR_INVALID_AGE)
+        (asserts! (> (len expertise-needed) u0) ERR_INVALID_EXPERTISE)
+        
+        ;; Check mentor capacity
+        (asserts! (< (get active-mentorships mentor-info) MAX_MENTORSHIPS_PER_MENTOR) ERR_MAX_DELEGATION_REACHED)
+        
+        ;; Ensure no existing application or mentorship
+        (asserts! (is-none (map-get? mentorship-applications {applicant: tx-sender, mentor: mentor})) ERR_MENTORSHIP_ALREADY_EXISTS)
+        (asserts! (is-none (map-get? mentorships {mentor: mentor, mentee: tx-sender})) ERR_MENTORSHIP_ALREADY_EXISTS)
+        
+        ;; Create application
+        (map-set mentorship-applications {applicant: tx-sender, mentor: mentor} {
+            expertise-needed: expertise-needed,
+            application-block: stacks-block-height
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (accept-mentee (mentee principal))
+    (let (
+        (mentor tx-sender)
+        (application (unwrap! (map-get? mentorship-applications {applicant: mentee, mentor: mentor}) ERR_MENTORSHIP_NOT_FOUND))
+        (mentor-info (unwrap! (map-get? mentors mentor) ERR_NOT_MENTOR))
+    )
+        ;; Verify mentor capacity
+        (asserts! (< (get active-mentorships mentor-info) MAX_MENTORSHIPS_PER_MENTOR) ERR_MAX_DELEGATION_REACHED)
+        
+        ;; Create mentorship relationship
+        (map-set mentorships {mentor: mentor, mentee: mentee} {
+            start-block: stacks-block-height,
+            status: "active",
+            milestones-completed: u0,
+            total-milestones: u3
+        })
+        
+        ;; Update mentor stats
+        (map-set mentors mentor (merge mentor-info {
+            active-mentorships: (+ (get active-mentorships mentor-info) u1),
+            total-mentorships: (+ (get total-mentorships mentor-info) u1)
+        }))
+        
+        ;; Remove application
+        (map-delete mentorship-applications {applicant: mentee, mentor: mentor})
+        
+        (ok true)
+    )
+)
+
+(define-public (complete-milestone (mentor principal))
+    (let (
+        (mentee tx-sender)
+        (mentorship (unwrap! (map-get? mentorships {mentor: mentor, mentee: mentee}) ERR_MENTORSHIP_NOT_FOUND))
+    )
+        ;; Verify mentorship is active
+        (asserts! (is-eq (get status mentorship) "active") ERR_MENTORSHIP_COMPLETED)
+        
+        ;; Check if all milestones already completed
+        (asserts! (< (get milestones-completed mentorship) (get total-milestones mentorship)) ERR_MENTORSHIP_COMPLETED)
+        
+        (let ((new-milestones (+ (get milestones-completed mentorship) u1)))
+            ;; Update milestone progress
+            (if (is-eq new-milestones (get total-milestones mentorship))
+                ;; Complete mentorship
+                (map-set mentorships {mentor: mentor, mentee: mentee} 
+                    (merge mentorship {
+                        milestones-completed: new-milestones,
+                        status: "completed"
+                    }))
+                ;; Continue mentorship
+                (map-set mentorships {mentor: mentor, mentee: mentee}
+                    (merge mentorship {milestones-completed: new-milestones}))
+            )
+        )
+        
+        ;; Reward mentee reputation
+        (let ((current-rep (default-to u0 (map-get? member-reputation mentee))))
+            (map-set member-reputation mentee (+ current-rep u2))
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (end-mentorship (mentee principal))
+    (let (
+        (mentor tx-sender)
+        (mentorship (unwrap! (map-get? mentorships {mentor: mentor, mentee: mentee}) ERR_MENTORSHIP_NOT_FOUND))
+        (mentor-info (unwrap! (map-get? mentors mentor) ERR_NOT_MENTOR))
+    )
+        ;; Update mentorship status
+        (map-set mentorships {mentor: mentor, mentee: mentee}
+            (merge mentorship {status: "ended"}))
+        
+        ;; Update mentor active count
+        (map-set mentors mentor (merge mentor-info {
+            active-mentorships: (- (get active-mentorships mentor-info) u1)
+        }))
+        
+        ;; Reward mentor reputation based on milestones completed
+        (let ((mentor-rep (default-to u0 (map-get? member-reputation mentor))))
+            (map-set member-reputation mentor 
+                (+ mentor-rep (get milestones-completed mentorship)))
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (rate-mentor (mentor principal) (rating uint))
+    (let (
+        (mentee tx-sender)
+        (mentorship (unwrap! (map-get? mentorships {mentor: mentor, mentee: mentee}) ERR_MENTORSHIP_NOT_FOUND))
+        (mentor-info (unwrap! (map-get? mentors mentor) ERR_NOT_MENTOR))
+    )
+        ;; Verify mentorship is completed
+        (asserts! (is-eq (get status mentorship) "completed") ERR_MENTORSHIP_NOT_FOUND)
+        
+        ;; Verify rating is valid (1-5 scale)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_AMOUNT)
+        
+        ;; Update mentor rating
+        (map-set mentors mentor (merge mentor-info {
+            rating-sum: (+ (get rating-sum mentor-info) rating),
+            rating-count: (+ (get rating-count mentor-info) u1)
+        }))
+        
+        (ok true)
+    )
+)
+
+;; Read-only functions for mentorship system
+
+(define-read-only (get-mentor-profile (mentor principal))
+    (map-get? mentors mentor)
+)
+
+(define-read-only (get-mentorship-details (mentor principal) (mentee principal))
+    (map-get? mentorships {mentor: mentor, mentee: mentee})
+)
+
+(define-read-only (get-mentorship-application (applicant principal) (mentor principal))
+    (map-get? mentorship-applications {applicant: applicant, mentor: mentor})
+)
+
+(define-read-only (calculate-mentor-rating (mentor principal))
+    (match (map-get? mentors mentor)
+        mentor-info (if (> (get rating-count mentor-info) u0)
+            (/ (get rating-sum mentor-info) (get rating-count mentor-info))
+            u0)
+        u0
+    )
+)
+
+(define-read-only (is-active-mentorship (mentor principal) (mentee principal))
+    (match (map-get? mentorships {mentor: mentor, mentee: mentee})
+        mentorship (is-eq (get status mentorship) "active")
+        false
+    )
+)
+
+(define-read-only (get-mentorship-progress (mentor principal) (mentee principal))
+    (match (map-get? mentorships {mentor: mentor, mentee: mentee})
+        mentorship {
+            milestones-completed: (get milestones-completed mentorship),
+            total-milestones: (get total-milestones mentorship),
+            progress-percentage: (/ (* (get milestones-completed mentorship) u100) (get total-milestones mentorship))
+        }
+        {milestones-completed: u0, total-milestones: u0, progress-percentage: u0}
     )
 )
 
